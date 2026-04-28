@@ -31,17 +31,17 @@ function App() {
     try {
       const res = await fetch('https://vpn.st098.top/api/vpngate');
       
-      // 1. 获取哈希进行验签
-      const hash = res.headers.get('X-CSV-Hash') || '';
-      const csv = await res.text();
+      // 1. Parse JSON wrapper from API
+      const json = await res.json();
+      if (!json.data) throw new Error("No data");
       
-      if (csv.includes('Error') || csv.length < 100) {
-         throw new Error("Invalid data received");
-      }
+      const csv = json.data;
+      const hash = res.headers.get('X-CSV-Hash') || '';
 
+      // 2. Verify Hash
       const isValid = await invoke('verify_csv_hash', { csv, hash });
       if (!isValid) {
-        alert('数据校验失败，可能存在中间人攻击');
+        alert('数据校验失败');
         return;
       }
 
@@ -58,14 +58,8 @@ function App() {
     const dataLines = lines.slice(dataStartIndex).filter(l => l.trim().length > 0);
     
     const parsed = dataLines.map((line, idx) => {
-      // Safe split for VPNGate CSV (15 columns)
-      // We split into 15 parts. If more commas exist, they belong to the last part? 
-      // Actually VPNGate Base64 shouldn't have commas, but let's be safe.
-      // We only care about specific indices.
       const parts = line.split(',');
       if (parts.length < 15) return null;
-      
-      const base64Part = parts.slice(14).join(',');
       
       return {
         id: idx,
@@ -76,7 +70,7 @@ function App() {
         speed: parseInt(parts[4]) || 0,
         country: parts[5],
         users: parseInt(parts[7]) || 0,
-        configBase64: base64Part.trim(),
+        configBase64: parts.slice(14).join(','),
       };
     }).filter(Boolean) as VpnServer[];
 
@@ -84,7 +78,6 @@ function App() {
     setServers(filtered);
   };
 
-  // Rust Ping
   const measureLatency = async (ip: string): Promise<number> => {
     try {
       return await invoke('ping_host', { host: ip });
