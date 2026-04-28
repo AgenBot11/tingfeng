@@ -4,7 +4,6 @@ import { invoke } from '@tauri-apps/api/tauri';
 import QRCode from 'react-qr-code';
 import { Modal } from './components/Modal';
 
-// 定义服务器数据类型
 interface VpnServer {
   id: number;
   hostName: string;
@@ -15,7 +14,7 @@ interface VpnServer {
   country: string;
   users: number;
   configBase64: string;
-  localLatency?: number; // 本地测速结果
+  localLatency?: number;
 }
 
 function App() {
@@ -27,42 +26,46 @@ function App() {
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(false);
 
-  // 拉取数据
   const fetchServers = useCallback(async () => {
     setLoading(true);
     try {
-      // 尝试从 API 获取
       const res = await fetch('https://vpn.st098.top/api/vpngate');
-      const json = await res.json();
       
-      if (json.status === 'ok' && json.data) {
-        parseVpnGateData(json.data);
+      // 1. 获取哈希进行验签
+      const hash = res.headers.get('X-CSV-Hash') || '';
+      const csv = await res.text();
+      
+      if (csv.includes('Error') || csv.length < 100) {
+         throw new Error("Invalid data received");
       }
+
+      const isValid = await invoke('verify_csv_hash', { csv, hash });
+      if (!isValid) {
+        alert('数据校验失败，可能存在中间人攻击');
+        return;
+      }
+
+      parseVpnGateData(csv);
     } catch (e) {
       console.error("API fetch failed", e);
     }
     setLoading(false);
   }, []);
 
-  // 解析 VPNGate CSV
   const parseVpnGateData = (csv: string) => {
     const lines = csv.split('\n');
     const dataStartIndex = lines.findIndex(l => l.includes('*vpn_servers')) + 2;
     const dataLines = lines.slice(dataStartIndex).filter(l => l.trim().length > 0);
     
     const parsed = dataLines.map((line, idx) => {
-      // 处理 CSV，注意最后一项是 Base64，可能包含逗号，需要特殊处理
-      // 简单 split(',') 会破坏 Base64，但 VPNGate CSV 格式通常是逗号分隔，最后一项很长
-      // 这里假设前 14 项不含逗号，剩下的都是 Base64
-      // 更严谨的做法是匹配逗号，但前 14 项确实没有逗号
-      
-      // 实际上 OpenVPN config 里可能有逗号？不，Base64 不会有逗号。
-      // 所以 split(',') 是安全的，除了最后一项。
-      // 其实 Base64 字符串里可能有逗号吗？不可能。
-      // 但是 CSV 字段本身如果有逗号会被双引号括起来。
-      // 简单处理：split(',') 取前 14 个，剩下的合并。
+      // Safe split for VPNGate CSV (15 columns)
+      // We split into 15 parts. If more commas exist, they belong to the last part? 
+      // Actually VPNGate Base64 shouldn't have commas, but let's be safe.
+      // We only care about specific indices.
       const parts = line.split(',');
-      const base64Part = parts.slice(14).join(','); // 实际上只有 15 列，第 15 列是 base64
+      if (parts.length < 15) return null;
+      
+      const base64Part = parts.slice(14).join(',');
       
       return {
         id: idx,
@@ -75,40 +78,32 @@ function App() {
         users: parseInt(parts[7]) || 0,
         configBase64: base64Part.trim(),
       };
-    });
+    }).filter(Boolean) as VpnServer[];
 
-    // 过滤低分节点
     const filtered = parsed.filter(s => s.score > 50 && s.ip && s.configBase64);
     setServers(filtered);
   };
 
-  // 本地测速 (简单 TCP 连接测试)
-  const measureLatency = async (ip: string, port: number): Promise<number> => {
-    // 在浏览器环境无法直接 Ping，这里模拟或者用 fetch 测 API 延迟
-    // 在 Tauri 中可以通过 Rust 调用系统 ping
-    // 简单起见，这里用 fetch 一个极小资源测时间
-    const start = performance.now();
+  // Rust Ping
+  const measureLatency = async (ip: string): Promise<number> => {
     try {
-      await fetch(`http://${ip}:${port}`, { mode: 'no-cors', cache: 'no-store' });
-    } catch (e) {}
-    return Math.round(performance.now() - start);
+      return await invoke('ping_host', { host: ip });
+    } catch {
+      return 9999;
+    }
   };
 
-  // 批量测速（仅对前 20 个节点）
   const runSpeedTest = async () => {
     const topServers = servers.slice(0, 20);
     for (const s of topServers) {
-      const lat = await measureLatency(s.ip, 80); // 测 HTTP 端口延迟
+      const lat = await measureLatency(s.ip);
       setServers(prev => prev.map(item => item.id === s.id ? { ...item, localLatency: lat } : item));
     }
   };
 
-  // 分享二维码
   const shareServer = (server: VpnServer) => {
     try {
       const config = atob(server.configBase64);
-      // 插入用户名密码
-      // Shadowrocket 扫码直接认 ovpn 文本
       setQrData(config);
       setShowQr(true);
     } catch (e) {
@@ -116,10 +111,8 @@ function App() {
     }
   };
 
-  // 连接 VPN
   const connect = async (server: VpnServer) => {
     try {
-      // 传递 Base64 给 Rust 处理
       await invoke('connect_vpn', { configB64: server.configBase64 });
       setIsConnected(true);
       setConnectedIp(server.ip);
@@ -130,18 +123,14 @@ function App() {
 
   useEffect(() => {
     fetchServers();
-    const interval = setInterval(fetchServers, 300000); // 5 分钟刷新
-    return () => clearInterval(interval);
   }, [fetchServers]);
 
-  // 过滤
   const filteredServers = servers
     .filter(s => s.country.toLowerCase().includes(search.toLowerCase()))
     .sort((a, b) => (a.localLatency || a.ping) - (b.localLatency || b.ping));
 
   return (
     <div className="h-screen bg-[#0f172a] text-white flex flex-col">
-      {/* Header */}
       <header className="p-4 bg-[#1e293b] flex justify-between items-center shadow-md">
         <div className="flex items-center gap-2">
           <span className="text-2xl">🍃</span>
@@ -163,18 +152,16 @@ function App() {
         </div>
       </header>
 
-      {/* Search */}
       <div className="p-4 bg-[#1e293b] border-b border-gray-700">
         <input 
           type="text" 
-          placeholder="搜索国家 (例如: Japan, United States)..." 
+          placeholder="搜索国家..." 
           className="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:border-brand"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
       </div>
 
-      {/* Server List */}
       <div className="flex-1 overflow-auto p-4">
         {loading ? (
           <div className="text-center py-10">加载中...</div>
@@ -198,14 +185,9 @@ function App() {
                   <div className="text-right">
                     <div className="text-xs text-gray-400">延迟</div>
                     <div className={`font-mono font-bold ${server.localLatency ? (server.localLatency < 100 ? 'text-green-400' : 'text-yellow-400') : 'text-gray-500'}`}>
-                      {server.localLatency ? `${server.localLatency} ms` : `${server.ping} ms`}
+                      {server.localLatency ? `${server.localLatency} ms` : '---'}
                     </div>
                   </div>
-                  <div className="text-right hidden sm:block">
-                    <div className="text-xs text-gray-400">速度</div>
-                    <div className="font-mono text-blue-400">{(server.speed / 1000000).toFixed(1)} MB/s</div>
-                  </div>
-                  
                   <div className="flex gap-2">
                     <button 
                       onClick={() => shareServer(server)}
@@ -227,7 +209,6 @@ function App() {
         )}
       </div>
 
-      {/* Modal for QR */}
       {showQr && <Modal onClose={() => setShowQr(false)} title="手机扫码连接">
         <div className="bg-white p-4 rounded-lg inline-block">
           <QRCode value={qrData} size={256} />
@@ -235,10 +216,9 @@ function App() {
         <p className="text-sm text-gray-400 mt-4 text-center">打开 Shadowrocket 扫码即可</p>
       </Modal>}
 
-      {/* Footer */}
       <footer className="p-2 text-center text-gray-500 text-xs border-t border-gray-700 bg-[#1e293b]">
         <a href="#" className="hover:text-brand mr-4">❤️ 赞助开发者</a>
-        <span>v1.0.0</span>
+        <span>v1.0.1 (Optimized)</span>
       </footer>
     </div>
   );
